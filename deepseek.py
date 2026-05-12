@@ -20,19 +20,17 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QTabWidget, QTreeWidget, QTreeWidgetItem, QCheckBox as QCheckBoxWidget)
 from PySide6.QtCore import Qt, QThread, Signal, QEvent, QUrl
 from PySide6.QtGui import QFont, QPalette, QColor, QFontDatabase, QDesktopServices
-
-# ---------- API 配置 ----------
-API_URL = "https://api.deepseek.com/v1/chat/completions"
-MODEL_CHAT = "deepseek-chat"
-MODEL_REASONER = "deepseek-reasoner"
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtCore import QObject, Slot
 
 # ---------- 配置文件路径 ----------
 DOCUMENTS_DIR = Path.home() / "Documents" / "DeepSeekClient"
-DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-
+DOCUMENTS_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = DOCUMENTS_DIR / "deepseek_config.json"
 ARCHIVE_DIR = DOCUMENTS_DIR / "archives"
-ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+ARCHIVE_DIR.mkdir(exist_ok=True)
+
 # ---------- 字体存储目录 ----------
 FONTS_DIR = Path(__file__).parent / "fonts"
 FONTS_DIR.mkdir(exist_ok=True)
@@ -40,6 +38,22 @@ FONTS_DIR.mkdir(exist_ok=True)
 # ---------- 插件目录 ----------
 PLUGIN_DIR = Path(__file__).parent / "mood"
 PLUGIN_DIR.mkdir(exist_ok=True)
+
+# ---------- 默认提供商 ----------
+DEFAULT_PROVIDERS = [
+    {
+        "name": "DeepSeek",
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key": "",
+        "models": ["deepseek-chat", "deepseek-reasoner"]
+    },
+    {
+        "name": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "models": ["gpt-3.5-turbo", "gpt-4", "gpt-4o"]
+    }
+]
 
 # ---------- 字符过滤 ----------
 def filter_text(text):
@@ -50,7 +64,7 @@ def filter_text(text):
 def markdown_to_html(text):
     md_extensions = ['extra', 'tables', 'fenced_code', 'codehilite']
     html_content = markdown.markdown(text, extensions=md_extensions)
-    html_content = html_content.replace('<tr>', '<table class="markdown-table">')
+    html_content = html_content.replace('<table>', '<table class="markdown-table">')
     return html_content
 
 # ---------- Token 估算 ----------
@@ -113,17 +127,18 @@ class StreamWorker(QThread):
     chunk_received = Signal(str, str)  # (type, content) type: 'reasoning', 'content', 'error'
     finished = Signal()
 
-    def __init__(self, api_key, messages, model):
+    def __init__(self, api_key, messages, model, base_url):
         super().__init__()
         self.api_key = api_key
         self.messages = messages
         self.model = model
+        self.api_url = f"{base_url.rstrip('/')}/chat/completions"
 
     def run(self):
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {"model": self.model, "messages": self.messages, "stream": True}
         try:
-            response = requests.post(API_URL, headers=headers, json=payload, stream=True, timeout=300)
+            response = requests.post(self.api_url, headers=headers, json=payload, stream=True, timeout=120)
             if response.status_code != 200:
                 self.chunk_received.emit("error", f"API 错误 {response.status_code}")
                 self.finished.emit()
@@ -165,7 +180,7 @@ class ReasoningDialog(QDialog):
         self.setWindowTitle("实时推理过程")
         self.resize(800, 600)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("正在等待数据…"))
+        layout.addWidget(QLabel("正在接收实时推理过程…"))
         self.display = QTextEdit()
         self.display.setReadOnly(True)
         self.display.setFont(QFont("Microsoft YaHei", 10))
@@ -178,20 +193,16 @@ class ReasoningDialog(QDialog):
         self.current_content = ""
         self._initialized = True
 
-    def start_stream(self, api_key, messages, model, prompt_name):
-        """启动新推理，追加到现有内容"""
-        # 添加分隔线和提示信息
+    def start_stream(self, provider, messages, model, prompt_name):
         separator = "\n" + "="*60 + f"\n【新对话】提示词: {prompt_name}  时间: {datetime.now().strftime('%H:%M:%S')}\n" + "="*60 + "\n"
         self.display.append(separator)
-        # 清空当前累积（新推理）
         self.current_reasoning = ""
         self.current_content = ""
-        # 重置标题插入标记
         self._reasoning_title_inserted = False
         self._content_title_inserted = False
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
-        self.worker = StreamWorker(api_key, messages, model)
+        self.worker = StreamWorker(provider["api_key"], messages, model, provider["base_url"])
         self.worker.chunk_received.connect(self.on_chunk)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
@@ -215,7 +226,7 @@ class ReasoningDialog(QDialog):
 
     def append_content(self, text):
         if self._reasoning_title_inserted and not self._content_title_inserted:
-            self.display.append("")  # 空行分隔
+            self.display.append("")
             self.display.append("<b>【最终回复】</b>")
             self._content_title_inserted = True
         elif not self._content_title_inserted:
@@ -227,7 +238,6 @@ class ReasoningDialog(QDialog):
     def on_finished(self):
         if not self.current_content and not self.current_reasoning:
             self.display.append("未接收到内容，请检查网络或API Key。")
-        # 添加空行分隔
         self.display.append("\n")
 
     def closeEvent(self, event):
@@ -244,10 +254,10 @@ class PluginManagerDialog(QDialog):
         self.resize(500, 400)
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("已加载的插件："))
+        layout.addWidget(QLabel("已加载的插件（mood文件夹）："))
         self.plugin_list = QListWidget()
         self.checkboxes = []
-        for idx, plugin in enumerate(plugin_manager.plugins):
+        for plugin in plugin_manager.plugins:
             item_widget = QWidget()
             item_layout = QHBoxLayout(item_widget)
             item_layout.setContentsMargins(0,0,0,0)
@@ -278,7 +288,7 @@ class PluginManagerDialog(QDialog):
     def refresh_plugins(self):
         self.plugin_manager.load_plugins()
         self.plugin_list.clear()
-        for idx, plugin in enumerate(self.plugin_manager.plugins):
+        for plugin in self.plugin_manager.plugins:
             item_widget = QWidget()
             item_layout = QHBoxLayout(item_widget)
             cb = QCheckBoxWidget(f"{plugin['name']} v{plugin['version']}")
@@ -296,17 +306,18 @@ class Worker(QThread):
     finished = Signal(str, dict)
     error = Signal(str)
 
-    def __init__(self, api_key, messages, model):
+    def __init__(self, api_key, messages, model, base_url):
         super().__init__()
         self.api_key = api_key
         self.messages = messages
         self.model = model
+        self.api_url = f"{base_url.rstrip('/')}/chat/completions"
 
     def run(self):
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {"model": self.model, "messages": self.messages, "stream": False}
         try:
-            response = requests.post(API_URL, headers=headers, json=payload, timeout=300)
+            response = requests.post(self.api_url, headers=headers, json=payload, timeout=120)
             if response.status_code == 200:
                 result = response.json()
                 reply = result["choices"][0]["message"]["content"]
@@ -376,16 +387,121 @@ class SearchDialog(QDialog):
         self.parent().jump_to_message(idx)
         self.close()
 
+# ---------- 提供商管理对话框 ----------
+class ProviderManagerDialog(QDialog):
+    def __init__(self, providers, parent=None):
+        super().__init__(parent)
+        self.providers = providers
+        self.setWindowTitle("API 提供商管理")
+        self.resize(700, 500)
+        layout = QVBoxLayout(self)
+
+        self.list_widget = QListWidget()
+        self.refresh_list()
+        layout.addWidget(self.list_widget)
+
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("添加")
+        add_btn.clicked.connect(self.add_provider)
+        edit_btn = QPushButton("编辑")
+        edit_btn.clicked.connect(self.edit_provider)
+        del_btn = QPushButton("删除")
+        del_btn.clicked.connect(self.delete_provider)
+        refresh_models_btn = QPushButton("刷新模型列表")
+        refresh_models_btn.clicked.connect(self.refresh_models)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(del_btn)
+        btn_layout.addWidget(refresh_models_btn)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        for p in self.providers:
+            item = QListWidgetItem(f"{p['name']} - {p['base_url']} (Key: {'***' + p['api_key'][-4:] if p['api_key'] else '未配置'})")
+            self.list_widget.addItem(item)
+
+    def add_provider(self):
+        name, ok = QInputDialog.getText(self, "添加提供商", "名称:")
+        if not ok or not name.strip():
+            return
+        url, ok = QInputDialog.getText(self, "添加提供商", "Base URL (例如 https://api.openai.com/v1):")
+        if not ok or not url.strip():
+            return
+        key, ok = QInputDialog.getText(self, "添加提供商", "API Key:", echo=QLineEdit.Password)
+        if ok:
+            self.providers.append({
+                "name": name.strip(),
+                "base_url": url.strip(),
+                "api_key": key.strip(),
+                "models": []
+            })
+            self.refresh_list()
+
+    def edit_provider(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0:
+            return
+        p = self.providers[idx]
+        name, ok = QInputDialog.getText(self, "编辑", "名称:", text=p["name"])
+        if not ok:
+            return
+        url, ok = QInputDialog.getText(self, "编辑", "Base URL:", text=p["base_url"])
+        if not ok:
+            return
+        key, ok = QInputDialog.getText(self, "编辑", "API Key:", text=p["api_key"], echo=QLineEdit.Password)
+        if ok:
+            p["name"] = name.strip()
+            p["base_url"] = url.strip()
+            p["api_key"] = key.strip()
+            self.refresh_list()
+
+    def delete_provider(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0:
+            return
+        if QMessageBox.question(self, "确认", "确定删除该提供商吗？") == QMessageBox.Yes:
+            del self.providers[idx]
+            self.refresh_list()
+
+    def refresh_models(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0:
+            QMessageBox.warning(self, "提示", "请先选择一个提供商")
+            return
+        provider = self.providers[idx]
+        models_url = f"{provider['base_url'].rstrip('/')}/models"
+        api_key = provider["api_key"]
+        if not api_key:
+            QMessageBox.warning(self, "提示", "该提供商未配置 API Key")
+            return
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"}
+            resp = requests.get(models_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [m["id"] for m in data.get("data", [])]
+                provider["models"] = sorted(set(models))
+                QMessageBox.information(self, "成功", f"获取到 {len(models)} 个模型")
+            else:
+                QMessageBox.warning(self, "错误", f"HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
+
 # ---------- 主窗口 ----------
 class DeepSeekClient(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DeepSeek")
-        self.resize(1000, 750)
-        self.setMinimumSize(800, 600)
+        self.resize(1100, 800)
+        self.setMinimumSize(900, 650)
 
         self.prompts = []
         self.current_prompt_index = 0
+        self.providers = []
         self.config = {}
         self.total_tokens_used = 0
         self.archived_conversations = []
@@ -428,34 +544,55 @@ class DeepSeekClient(QMainWindow):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.config = data.get("global", {})
+                    self.providers = data.get("providers", DEFAULT_PROVIDERS)
                     self.prompts = data.get("prompts", [])
                     self.archived_conversations = data.get("archives", [])
             else:
                 self.config = {}
+                self.providers = DEFAULT_PROVIDERS
                 self.prompts = []
                 self.archived_conversations = []
         except Exception:
-            self.config, self.prompts, self.archived_conversations = {}, [], []
+            self.config = {}
+            self.providers = DEFAULT_PROVIDERS
+            self.prompts = []
+            self.archived_conversations = []
+
+        if not self.providers:
+            self.providers = DEFAULT_PROVIDERS
         if not self.prompts:
-            self.prompts.append({"name": "默认助手", "system_prompt": "You are a helpful assistant.", "messages": [], "model": MODEL_CHAT})
-        for p in self.prompts:
-            if "model" not in p:
-                p["model"] = MODEL_CHAT
+            self.prompts.append({
+                "name": "默认助手",
+                "system_prompt": "You are a helpful assistant.",
+                "messages": [],
+                "provider_index": 0,
+                "model": self.providers[0]["models"][0] if self.providers[0]["models"] else "default"
+            })
+
         self.current_prompt_index = self.config.get("current_prompt_index", 0)
         if self.current_prompt_index >= len(self.prompts):
             self.current_prompt_index = 0
         self.total_tokens_used = self.config.get("total_tokens_used", 0)
 
     def save_config(self):
+        # 将当前界面 Key 同步到 provider
+        idx = self.provider_combo.currentIndex()
+        if 0 <= idx < len(self.providers):
+            self.providers[idx]["api_key"] = self.api_key_edit.text().strip()
+
         self.config.update({
-            "api_key": self.api_key_edit.text().strip(),
             "username": self.username_edit.text().strip(),
             "font_family": self.font_combo.currentFont().family(),
             "font_size": self.font_size_spin.value(),
             "current_prompt_index": self.current_prompt_index,
             "total_tokens_used": self.total_tokens_used
         })
-        data = {"global": self.config, "prompts": self.prompts, "archives": self.archived_conversations}
+        data = {
+            "global": self.config,
+            "providers": self.providers,
+            "prompts": self.prompts,
+            "archives": self.archived_conversations
+        }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -475,140 +612,214 @@ class DeepSeekClient(QMainWindow):
         else:
             is_light = True
         QApplication.setStyle(QStyleFactory.create("Fusion"))
-        (self.apply_light_theme if is_light else self.apply_dark_theme)()
+        self.current_theme = "light" if is_light else "dark"
+        self.apply_theme_to_pyside(is_light)
+        if hasattr(self, 'chat_view'):
+            self.set_web_theme(self.current_theme)
 
-    def apply_light_theme(self):
-        p = QPalette()
-        p.setColor(QPalette.Window, QColor(240,240,240))
-        p.setColor(QPalette.WindowText, Qt.black)
-        p.setColor(QPalette.Base, Qt.white)
-        p.setColor(QPalette.Text, Qt.black)
-        p.setColor(QPalette.Button, QColor(240,240,240))
-        p.setColor(QPalette.ButtonText, Qt.black)
-        QApplication.setPalette(p)
-        self.setStyleSheet("""
-            QGroupBox{border:1px solid #ccc;border-radius:5px;margin-top:0.5em;}
-            QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}
-            QPushButton{background:#e0e0e0;border:1px solid #aaa;border-radius:3px;padding:5px;}
-            QPushButton:hover{background:#d0d0d0;}
-            QLineEdit,QTextEdit,QComboBox{border:1px solid #ccc;border-radius:3px;padding:3px;}
-        """)
-        self.chat_display.setStyleSheet("""
-            QTextEdit {
-                background: white;
-                border: none;
-                font-family: "Microsoft YaHei";
-            }
-            pre {
-                background-color: #f4f4f4;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                padding: 8px;
-                font-family: monospace;
-                overflow-x: auto;
-            }
-            code {
-                background-color: #f4f4f4;
-                border-radius: 3px;
-                padding: 2px 4px;
-                font-family: monospace;
-            }
-            blockquote {
-                border-left: 3px solid #ccc;
-                margin: 0;
-                padding-left: 10px;
-                color: #555;
-            }
-            table.markdown-table {
-                border-collapse: collapse;
-                width: 100%;
-                margin: 10px 0;
-            }
-            table.markdown-table th,
-            table.markdown-table td {
-                border: 1px solid #ddd;
-                padding: 6px;
-                text-align: left;
-            }
-            table.markdown-table th {
-                background-color: #f2f2f2;
-                font-weight: bold;
-            }
-        """)
-        self.top_role_label.setStyleSheet("font-weight:bold;font-size:14px;background:#e0e0e0;padding:5px;")
-        self.token_label_title.setStyleSheet("font-size:10px;color:#555;")
-        self.token_label_value.setStyleSheet("font-size:12px;font-weight:bold;color:#555;")
-        self.total_token_label.setStyleSheet("font-size:10px;color:#555;")
-        self.total_token_value.setStyleSheet("font-size:12px;font-weight:bold;color:#555;")
+    def apply_theme_to_pyside(self, is_light):
+        if is_light:
+            p = QPalette()
+            p.setColor(QPalette.Window, QColor(240,240,240))
+            p.setColor(QPalette.WindowText, Qt.black)
+            p.setColor(QPalette.Base, Qt.white)
+            p.setColor(QPalette.Text, Qt.black)
+            p.setColor(QPalette.Button, QColor(240,240,240))
+            p.setColor(QPalette.ButtonText, Qt.black)
+            QApplication.setPalette(p)
+            self.setStyleSheet("""
+                QGroupBox{border:1px solid #ccc;border-radius:5px;margin-top:0.5em;}
+                QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}
+                QPushButton{background:#e0e0e0;border:1px solid #aaa;border-radius:3px;padding:5px;}
+                QPushButton:hover{background:#d0d0d0;}
+                QLineEdit,QTextEdit,QComboBox{border:1px solid #ccc;border-radius:3px;padding:3px;}
+            """)
+        else:
+            p = QPalette()
+            p.setColor(QPalette.Window, QColor(53,53,53))
+            p.setColor(QPalette.WindowText, Qt.white)
+            p.setColor(QPalette.Base, QColor(25,25,25))
+            p.setColor(QPalette.Text, Qt.white)
+            p.setColor(QPalette.Button, QColor(53,53,53))
+            p.setColor(QPalette.ButtonText, Qt.white)
+            QApplication.setPalette(p)
+            self.setStyleSheet("""
+                QGroupBox{border:1px solid #555;border-radius:5px;margin-top:0.5em;color:#fff;}
+                QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;color:#fff;}
+                QPushButton{background:#3c3c3c;border:1px solid #555;border-radius:3px;padding:5px;color:#fff;}
+                QPushButton:hover{background:#4a4a4a;}
+                QLineEdit,QTextEdit,QComboBox{background:#3c3c3c;border:1px solid #555;border-radius:3px;padding:3px;color:#fff;}
+                QLabel{color:#fff;}
+            """)
 
-    def apply_dark_theme(self):
-        p = QPalette()
-        p.setColor(QPalette.Window, QColor(53,53,53))
-        p.setColor(QPalette.WindowText, Qt.white)
-        p.setColor(QPalette.Base, QColor(25,25,25))
-        p.setColor(QPalette.Text, Qt.white)
-        p.setColor(QPalette.Button, QColor(53,53,53))
-        p.setColor(QPalette.ButtonText, Qt.white)
-        QApplication.setPalette(p)
-        self.setStyleSheet("""
-            QGroupBox{border:1px solid #555;border-radius:5px;margin-top:0.5em;color:#fff;}
-            QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;color:#fff;}
-            QPushButton{background:#3c3c3c;border:1px solid #555;border-radius:3px;padding:5px;color:#fff;}
-            QPushButton:hover{background:#4a4a4a;}
-            QLineEdit,QTextEdit,QComboBox{background:#3c3c3c;border:1px solid #555;border-radius:3px;padding:3px;color:#fff;}
-            QLabel{color:#fff;}
-        """)
-        self.chat_display.setStyleSheet("""
-            QTextEdit {
-                background: #1e1e1e;
-                border: none;
-                color: #fff;
-                font-family: "Microsoft YaHei";
-            }
-            pre {
-                background-color: #2d2d2d;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 8px;
-                font-family: monospace;
-                color: #ddd;
-                overflow-x: auto;
-            }
-            code {
-                background-color: #2d2d2d;
-                border-radius: 3px;
-                padding: 2px 4px;
-                font-family: monospace;
-                color: #ddd;
-            }
-            blockquote {
-                border-left: 3px solid #888;
-                margin: 0;
-                padding-left: 10px;
-                color: #aaa;
-            }
-            table.markdown-table {
-                border-collapse: collapse;
-                width: 100%;
-                margin: 10px 0;
-            }
-            table.markdown-table th,
-            table.markdown-table td {
-                border: 1px solid #555;
-                padding: 6px;
-                text-align: left;
-                color: #fff;
-            }
-            table.markdown-table th {
-                background-color: #3a3a3a;
-                font-weight: bold;
-            }
-        """)
-        self.top_role_label.setStyleSheet("font-weight:bold;font-size:14px;background:#3c3c3c;padding:5px;color:#fff;")
-        self.token_label_title.setStyleSheet("font-size:10px;color:#aaa;")
-        self.token_label_value.setStyleSheet("font-size:12px;font-weight:bold;color:#aaa;")
-        self.total_token_label.setStyleSheet("font-size:10px;color:#aaa;")
-        self.total_token_value.setStyleSheet("font-size:12px;font-weight:bold;color:#aaa;")
+    def set_web_theme(self, theme):
+        self.chat_view.page().runJavaScript(f"document.body.className = '{theme}';")
+
+    # ---------- Web UI 构建 (包含 MathJax) ----------
+    def build_initial_html(self):
+        return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- MathJax 配置 -->
+<script>
+MathJax = {
+    tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']]
+    },
+    svg: {
+        fontCache: 'global'
+    }
+};
+</script>
+<script id="MathJax-script" async 
+    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js">
+</script>
+
+<style>
+    body.light {
+        background: #ffffff;
+        color: #000;
+        font-family: 'Microsoft YaHei', sans-serif;
+        margin: 0;
+        padding: 10px;
+    }
+    body.dark {
+        background: #1e1e1e;
+        color: #ddd;
+        font-family: 'Microsoft YaHei', sans-serif;
+        margin: 0;
+        padding: 10px;
+    }
+    .msg { margin-bottom: 16px; }
+    .msg-label {
+        font-weight: bold;
+        margin-bottom: 4px;
+    }
+    .msg-content {
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+    pre {
+        background-color: #f4f4f4;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        padding: 8px;
+        font-family: monospace;
+        overflow-x: auto;
+    }
+    .dark pre {
+        background-color: #2d2d2d;
+        border-color: #444;
+        color: #ddd;
+    }
+    code {
+        background-color: #f4f4f4;
+        border-radius: 3px;
+        padding: 2px 4px;
+        font-family: monospace;
+    }
+    .dark code {
+        background-color: #2d2d2d;
+        color: #ddd;
+    }
+    table.markdown-table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 10px 0;
+    }
+    table.markdown-table th, table.markdown-table td {
+        border: 1px solid #ddd;
+        padding: 6px;
+        text-align: left;
+    }
+    .dark table.markdown-table th, .dark table.markdown-table td {
+        border: 1px solid #555;
+    }
+    table.markdown-table th {
+        background-color: #f2f2f2;
+        font-weight: bold;
+    }
+    .dark table.markdown-table th {
+        background-color: #3a3a3a;
+    }
+    blockquote {
+        border-left: 3px solid #ccc;
+        margin: 0;
+        padding-left: 10px;
+        color: #555;
+    }
+    .dark blockquote {
+        border-left-color: #888;
+        color: #aaa;
+    }
+    #chat-container {
+        max-width: 900px;
+        margin: 0 auto;
+    }
+</style>
+</head>
+<body class="light">
+<div id="chat-container"></div>
+<script>
+function clearChat() {
+    document.getElementById('chat-container').innerHTML = '';
+}
+function appendMessage(role, label, htmlContent) {
+    const container = document.getElementById('chat-container');
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.innerHTML = '<div class="msg-label">' + label + '</div>'
+                  + '<div class="msg-content">' + htmlContent + '</div>';
+    container.appendChild(div);
+
+    // 让 MathJax 重新排版新内容
+    if (window.MathJax) {
+        MathJax.typesetPromise([div]).catch(function (err) {
+            console.log('MathJax error: ' + err.message);
+        });
+    }
+
+    window.scrollTo(0, document.body.scrollHeight);
+}
+</script>
+</body>
+</html>
+"""
+
+    def setup_web_view(self, parent_layout):
+        self.chat_view = QWebEngineView()
+        self.channel = QWebChannel()
+        self.bridge = QObject()
+        self.channel.registerObject("bridge", self.bridge)
+        self.chat_view.page().setWebChannel(self.channel)
+        html = self.build_initial_html()
+        self.chat_view.setHtml(html)
+        parent_layout.addWidget(self.chat_view, 1)
+
+    def append_message_web(self, role, content, save=True):
+        username = self.username_edit.text().strip() or "我"
+        prompt = self.prompts[self.current_prompt_index]
+        rolename = prompt["name"]
+        if role == "assistant":
+            filtered = filter_text(content)
+            html_content = markdown_to_html(filtered)
+            safe = html_content.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n')
+            js = f"appendMessage('assistant', '【{rolename}】', '{safe}');"
+        elif role == "user":
+            safe = html.escape(filter_text(content)).replace('\n', '<br>')
+            safe_js = safe.replace('\\', '\\\\').replace("'", "\\'")
+            js = f"appendMessage('user', '【{username}】', '{safe_js}');"
+        else:
+            safe = html.escape(filter_text(content)).replace('\n', '<br>')
+            safe_js = safe.replace('\\', '\\\\').replace("'", "\\'")
+            js = f"appendMessage('system', '【系统】', '{safe_js}');"
+        self.chat_view.page().runJavaScript(js)
+        if save and role != "system":
+            prompt["messages"].append({"role": role, "content": content})
+            self.save_config()
 
     # ---------- UI 构建 ----------
     def setup_ui(self):
@@ -618,29 +829,40 @@ class DeepSeekClient(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
-        # 配置区域
+        # ---------- 基本配置 ----------
         config_group = QGroupBox("基本配置")
         grid = QGridLayout(config_group)
 
+        # 提供商选择
+        grid.addWidget(QLabel("当前提供商:"), 0, 0)
+        self.provider_combo = QComboBox()
+        self.provider_combo.currentIndexChanged.connect(self.on_provider_changed)
+        grid.addWidget(self.provider_combo, 0, 1)
+        manage_provider_btn = QPushButton("管理提供商")
+        manage_provider_btn.clicked.connect(self.manage_providers)
+        grid.addWidget(manage_provider_btn, 0, 2)
+
+        # API Key 输入框（密码模式 + 显示复选框）
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setText(self.config.get("api_key", ""))
-        self.api_key_edit.textChanged.connect(self.save_config)
+        self.api_key_edit.textChanged.connect(self.on_api_key_changed)
         self.show_key_cb = QCheckBox("显示")
         self.show_key_cb.toggled.connect(lambda checked: self.api_key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password))
         key_layout = QHBoxLayout()
+        key_layout.addWidget(QLabel("API Key:"))
         key_layout.addWidget(self.api_key_edit, 1)
         key_layout.addWidget(self.show_key_cb)
-        grid.addWidget(QLabel("API Key:"), 0, 0)
-        grid.addLayout(key_layout, 0, 1)
+        grid.addLayout(key_layout, 1, 0, 1, 3)
 
+        # 用户昵称
         self.username_edit = QLineEdit()
         self.username_edit.setPlaceholderText("你的昵称")
         self.username_edit.setText(self.config.get("username", "我"))
         self.username_edit.textChanged.connect(self.save_config)
-        grid.addWidget(QLabel("用户昵称:"), 1, 0)
-        grid.addWidget(self.username_edit, 1, 1)
+        grid.addWidget(QLabel("用户昵称:"), 2, 0)
+        grid.addWidget(self.username_edit, 2, 1, 1, 2)
 
+        # 字体设置
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(QFont(self.config.get("font_family", "Microsoft YaHei")))
         self.font_combo.currentFontChanged.connect(self.change_font)
@@ -659,11 +881,11 @@ class DeepSeekClient(QMainWindow):
         font_layout.addWidget(self.font_size_spin)
         font_layout.addWidget(import_btn)
         font_layout.addWidget(save_btn)
-        grid.addWidget(QLabel("聊天字体:"),2,0)
-        grid.addLayout(font_layout,2,1)
+        grid.addWidget(QLabel("聊天字体:"),3,0)
+        grid.addLayout(font_layout,3,1,1,2)
         layout.addWidget(config_group)
 
-        # 提示词管理
+        # ---------- 提示词管理 ----------
         prompt_group = QGroupBox("提示词管理")
         pvbox = QVBoxLayout(prompt_group)
         row1 = QHBoxLayout()
@@ -686,17 +908,15 @@ class DeepSeekClient(QMainWindow):
         pvbox.addLayout(row1)
 
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("当前提示词使用的模型:"))
+        row2.addWidget(QLabel("模型:"))
         self.model_combo = QComboBox()
-        self.model_combo.addItem("deepseek-chat", MODEL_CHAT)
-        self.model_combo.addItem("deepseek-reasoner", MODEL_REASONER)
         self.model_combo.currentIndexChanged.connect(self.on_model_changed)
         row2.addWidget(self.model_combo)
         row2.addStretch()
         pvbox.addLayout(row2)
         layout.addWidget(prompt_group)
 
-        # 对话区域
+        # ---------- 对话区域 ----------
         chat_group = QGroupBox("对话")
         chat_layout = QVBoxLayout(chat_group)
 
@@ -725,17 +945,14 @@ class DeepSeekClient(QMainWindow):
 
         chat_layout.addWidget(top_info_widget)
 
-        self.chat_display = QTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setAcceptRichText(True)
-        chat_layout.addWidget(self.chat_display)
+        # Web 聊天视图（替代旧 QTextEdit）
+        self.setup_web_view(chat_layout)
 
         # 输入区域
         input_widget = QWidget()
         input_v = QVBoxLayout(input_widget)
         input_v.setContentsMargins(0,0,0,0)
 
-        # 文件上传
         file_layout = QHBoxLayout()
         self.upload_btn = QPushButton("上传文件")
         self.upload_btn.clicked.connect(self.upload_file)
@@ -798,47 +1015,92 @@ class DeepSeekClient(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
-    # ---------- 文件上传 ----------
-    def upload_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择文件")
-        if not path:
+    # ---------- 提供商 UI 联动 ----------
+    def on_api_key_changed(self):
+        idx = self.provider_combo.currentIndex()
+        if 0 <= idx < len(self.providers):
+            self.providers[idx]["api_key"] = self.api_key_edit.text().strip()
+            self.save_config()
+
+    def on_provider_changed(self, idx):
+        if idx < 0:
             return
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            self.input_text.append(f"\n[文件内容：{Path(path).name}]\n{content}\n")
-            self.file_label.setText(f"已加载：{Path(path).name}")
-        except Exception as e:
-            QMessageBox.warning(self, "错误", f"读取失败: {e}")
+        if self.prompts:
+            self.prompts[self.current_prompt_index]["provider_index"] = idx
+        self.refresh_provider_key_display()
+        self.refresh_model_list()
+        self.save_config()
+
+    def refresh_provider_key_display(self):
+        idx = self.provider_combo.currentIndex()
+        if 0 <= idx < len(self.providers):
+            self.api_key_edit.blockSignals(True)
+            self.api_key_edit.setText(self.providers[idx]["api_key"])
+            self.api_key_edit.blockSignals(False)
+
+    def manage_providers(self):
+        dlg = ProviderManagerDialog(self.providers, self)
+        dlg.exec()
+        self.refresh_provider_ui()
+
+    def refresh_provider_ui(self):
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.clear()
+        for p in self.providers:
+            self.provider_combo.addItem(p["name"])
+        if self.prompts:
+            idx = self.prompts[self.current_prompt_index].get("provider_index", 0)
+            if idx < len(self.providers):
+                self.provider_combo.setCurrentIndex(idx)
+        self.provider_combo.blockSignals(False)
+        self.refresh_provider_key_display()
+        self.refresh_model_list()
+
+    def refresh_model_list(self):
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        provider = self.get_current_provider()
+        if provider:
+            for m in provider.get("models", []):
+                self.model_combo.addItem(m)
+        if self.prompts:
+            current_model = self.prompts[self.current_prompt_index].get("model", "")
+            idx = self.model_combo.findText(current_model)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+        self.model_combo.blockSignals(False)
+
+    def get_current_provider(self):
+        idx = self.provider_combo.currentIndex()
+        if 0 <= idx < len(self.providers):
+            return self.providers[idx]
+        return None
 
     # ---------- 辅助函数 ----------
     def change_font(self):
-        font = QFont(self.font_combo.currentFont().family(), self.font_size_spin.value())
-        self.chat_display.setFont(font)
         self.save_config()
 
     def load_current_prompt(self):
+        self.refresh_provider_ui()
         p = self.prompts[self.current_prompt_index]
         self.prompt_combo.blockSignals(True)
         self.prompt_combo.clear()
-        for idx, p2 in enumerate(self.prompts):
+        for p2 in self.prompts:
             self.prompt_combo.addItem(p2["name"])
         self.prompt_combo.setCurrentIndex(self.current_prompt_index)
         self.prompt_combo.blockSignals(False)
-        idx = self.model_combo.findData(p.get("model", MODEL_CHAT))
-        self.model_combo.blockSignals(True)
-        self.model_combo.setCurrentIndex(idx if idx!=-1 else 0)
-        self.model_combo.blockSignals(False)
         self.top_role_label.setText(f"当前角色：{p['name']}")
         self.refresh_chat_display()
 
     def refresh_chat_display(self):
-        self.chat_display.clear()
+        self.chat_view.page().runJavaScript("clearChat();")
         for msg in self.prompts[self.current_prompt_index].get("messages", []):
-            if msg["role"] == "user":
-                self.append_message("user", msg["content"], save=False)
-            elif msg["role"] == "assistant":
-                self.append_message("assistant", msg["content"], save=False)
+            role = msg["role"]
+            content = msg["content"]
+            if role == "user":
+                self.append_message_web("user", content, save=False)
+            elif role == "assistant":
+                self.append_message_web("assistant", content, save=False)
         self.update_token_display()
 
     def switch_prompt(self, idx):
@@ -866,7 +1128,16 @@ class DeepSeekClient(QMainWindow):
         dlg2 = MultiLineInputDialog("新建", "系统提示词:", text="You are a helpful assistant.", parent=self)
         if dlg2.exec() != QDialog.Accepted:
             return
-        self.prompts.append({"name": name, "system_prompt": dlg2.get_text(), "messages": [], "model": MODEL_CHAT})
+        provider_idx = self.provider_combo.currentIndex()
+        provider = self.providers[provider_idx] if provider_idx >=0 else self.providers[0]
+        model = provider["models"][0] if provider["models"] else ""
+        self.prompts.append({
+            "name": name,
+            "system_prompt": dlg2.get_text(),
+            "messages": [],
+            "provider_index": provider_idx,
+            "model": model
+        })
         self.current_prompt_index = len(self.prompts)-1
         self.save_config()
         self.load_current_prompt()
@@ -910,25 +1181,19 @@ class DeepSeekClient(QMainWindow):
             msgs.append({"role": "user", "content": cur})
         self.token_label_value.setText(str(count_tokens(msgs)))
 
-    def append_message(self, role, content, save=True):
-        username = self.username_edit.text().strip() or "我"
-        rolename = self.prompts[self.current_prompt_index]["name"]
-        if role == "assistant":
-            filtered = filter_text(content)
-            html_content = markdown_to_html(filtered)
-            html_msg = f'<div style="margin-bottom:8px;"><b>【{rolename}】</b><br>{html_content}</div>'
-        else:
-            safe = html.escape(filter_text(content)).replace('\n', '<br>')
-            if role == "user":
-                html_msg = f'<div style="margin-bottom:8px;"><b>【{username}】</b>{safe}</div>'
-            else:
-                html_msg = f'<div style="margin-bottom:8px;"><b>【系统】</b>{safe}</div>'
-        self.chat_display.insertHtml(html_msg)
-        self.chat_display.insertPlainText("\n")
-        self.chat_display.ensureCursorVisible()
-        if save and role != "system":
-            self.prompts[self.current_prompt_index]["messages"].append({"role": role, "content": content})
-            self.save_config()
+    def upload_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "文本文件 (*.txt);;所有文件 (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.input_text.append(f"\n[文件内容：{Path(path).name}]\n{content}\n")
+            self.file_label.setText(f"已加载：{Path(path).name}")
+        except UnicodeDecodeError:
+            QMessageBox.warning(self, "无法读取", "该文件不是 UTF-8 编码的文本文件，无法处理。")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"读取失败: {e}")
 
     # ---------- 对话管理功能 ----------
     def export_conversation(self):
@@ -942,7 +1207,7 @@ class DeepSeekClient(QMainWindow):
                 with open(filename, 'w', encoding='utf-8') as f:
                     f.write(f"对话导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write(f"提示词: {self.prompts[self.current_prompt_index]['name']}\n")
-                    f.write(f"模型: {self.prompts[self.current_prompt_index].get('model', MODEL_CHAT)}\n")
+                    f.write(f"提供商/模型: {self.prompts[self.current_prompt_index].get('model', 'N/A')}\n")
                     f.write("-" * 50 + "\n")
                     for msg in messages:
                         role = "用户" if msg["role"] == "user" else "助手"
@@ -961,10 +1226,7 @@ class DeepSeekClient(QMainWindow):
 
     def jump_to_message(self, index):
         self.refresh_chat_display()
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(cursor.End)
-        self.chat_display.setTextCursor(cursor)
-        QMessageBox.information(self, "提示", f"已跳转到第 {index+1} 条消息（请手动向上滚动查看）")
+        QMessageBox.information(self, "提示", f"已跳转到第 {index+1} 条消息（请手动滚动查看）")
 
     def archive_conversation(self):
         messages = self.prompts[self.current_prompt_index]["messages"]
@@ -978,7 +1240,7 @@ class DeepSeekClient(QMainWindow):
                 "messages": messages.copy(),
                 "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "prompt_name": self.prompts[self.current_prompt_index]["name"],
-                "model": self.prompts[self.current_prompt_index].get("model", MODEL_CHAT)
+                "model": self.prompts[self.current_prompt_index].get("model", "")
             }
             self.archived_conversations.append(archive)
             self.prompts[self.current_prompt_index]["messages"] = []
@@ -1024,6 +1286,7 @@ class DeepSeekClient(QMainWindow):
                         "name": new_name.strip(),
                         "system_prompt": self.prompts[self.current_prompt_index]["system_prompt"],
                         "messages": arch["messages"].copy(),
+                        "provider_index": self.prompts[self.current_prompt_index].get("provider_index", 0),
                         "model": arch["model"]
                     }
                     self.prompts.append(new_prompt)
@@ -1054,12 +1317,11 @@ class DeepSeekClient(QMainWindow):
 
         dialog.exec()
 
-    # ---------- 插件管理 ----------
     def manage_plugins(self):
         dialog = PluginManagerDialog(self.plugin_manager, self)
         dialog.exec()
 
-    # ---------- 发送消息（自动推理窗口，复用同一窗口）----------
+    # ---------- 发送消息 ----------
     def send_message(self):
         user_input = self.input_text.toPlainText().strip()
         if not user_input:
@@ -1067,10 +1329,11 @@ class DeepSeekClient(QMainWindow):
 
         self.trigger_plugin_hook("on_before_send", self, user_input)
 
-        api_key = self.api_key_edit.text().strip()
-        if not api_key:
-            QMessageBox.warning(self, "警告", "请填写 API Key")
+        provider = self.get_current_provider()
+        if not provider or not provider["api_key"]:
+            QMessageBox.warning(self, "警告", "请先配置 API 提供商和 Key")
             return
+
         p = self.prompts[self.current_prompt_index]
         sys_prompt = p["system_prompt"]
         username = self.username_edit.text().strip() or "我"
@@ -1082,33 +1345,34 @@ class DeepSeekClient(QMainWindow):
         msgs.extend(p["messages"])
         msgs.append({"role": "user", "content": user_input})
 
-        self.append_message("user", user_input)
+        self.append_message_web("user", user_input)
         self.input_text.clear()
         self.update_token_display()
 
-        model = p.get("model", MODEL_CHAT)
+        model = p.get("model", "")
+        if not model:
+            QMessageBox.warning(self, "错误", "当前提示词未选择模型")
+            return
+
         self.send_btn.setEnabled(False)
         self.reasoning_btn.setEnabled(False)
         self.status_label.setText(f"请求中... (模型: {model})")
 
-        # 如果是深度思考模式，打开或复用推理窗口
-        if model == MODEL_REASONER:
+        if "reasoner" in model.lower() or "deepseek-reasoner" in model:
             reasoning_dialog = ReasoningDialog(self)
-            reasoning_dialog.start_stream(api_key, msgs, model, p["name"])
+            reasoning_dialog.start_stream(provider, msgs, model, p["name"])
             reasoning_dialog.show()
             reasoning_dialog.raise_()
             reasoning_dialog.activateWindow()
 
-        # 非流式请求（用于主聊天区回复）
-        self.worker = Worker(api_key, msgs, model)
+        self.worker = Worker(provider["api_key"], msgs, model, provider["base_url"])
         self.worker.finished.connect(self.on_normal_finished)
         self.worker.error.connect(self.on_normal_error)
         self.worker.start()
 
     def on_normal_finished(self, reply, usage):
         self.trigger_plugin_hook("on_after_receive", self, reply)
-
-        self.append_message("assistant", reply)
+        self.append_message_web("assistant", reply)
         if usage and "total_tokens" in usage:
             self.total_tokens_used += usage["total_tokens"]
             self.total_token_value.setText(str(self.total_tokens_used))
@@ -1119,47 +1383,41 @@ class DeepSeekClient(QMainWindow):
         self.update_token_display()
 
     def on_normal_error(self, err):
-        self.append_message("system", f"错误: {err}")
+        self.append_message_web("system", f"错误: {err}")
         self.send_btn.setEnabled(True)
         self.reasoning_btn.setEnabled(True)
         self.status_label.setText("错误")
 
-    # ---------- 手动显示推理（复用同一窗口）----------
     def show_reasoning(self):
         user_input = self.input_text.toPlainText().strip()
         if not user_input:
             QMessageBox.warning(self, "提示", "请先输入消息内容")
             return
-        api_key = self.api_key_edit.text().strip()
-        if not api_key:
-            QMessageBox.warning(self, "警告", "请先填写 API Key")
+        provider = self.get_current_provider()
+        if not provider or not provider["api_key"]:
+            QMessageBox.warning(self, "警告", "请先配置 API 提供商和 Key")
             return
         p = self.prompts[self.current_prompt_index]
         sys_prompt = p["system_prompt"]
         username = self.username_edit.text().strip() or "我"
-        model = p.get("model", MODEL_CHAT)
-        if model != MODEL_REASONER:
-            reply = QMessageBox.question(self, "模型提醒", f"当前模型为 {model}，不提供推理过程。是否仍要继续（仅显示最终回复）？", QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
-
+        model = p.get("model", "")
         full_messages = []
-        modified_system = sys_prompt
-        if username and "用户" not in sys_prompt:
-            modified_system = f"用户的名字是{username}。\n{sys_prompt}"
-        if modified_system:
-            full_messages.append({"role": "system", "content": modified_system})
+        if sys_prompt:
+            modified = sys_prompt
+            if username and "用户" not in sys_prompt:
+                modified = f"用户的名字是{username}。\n{sys_prompt}"
+            full_messages.append({"role": "system", "content": modified})
         full_messages.extend(p["messages"])
         full_messages.append({"role": "user", "content": user_input})
 
         reasoning_dialog = ReasoningDialog(self)
-        reasoning_dialog.start_stream(api_key, full_messages, model, p["name"])
+        reasoning_dialog.start_stream(provider, full_messages, model, p["name"])
         reasoning_dialog.show()
         reasoning_dialog.raise_()
         reasoning_dialog.activateWindow()
 
     def on_model_changed(self, idx):
-        model = self.model_combo.itemData(idx)
+        model = self.model_combo.itemText(idx)
         if model:
             self.prompts[self.current_prompt_index]["model"] = model
             self.save_config()
